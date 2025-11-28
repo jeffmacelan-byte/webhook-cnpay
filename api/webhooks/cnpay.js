@@ -1,103 +1,75 @@
 import crypto from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
 
-/**
- * Faz a leitura do corpo da requisição caso o Vercel ainda não tenha feito o parse.
- * @param {import('@vercel/node').VercelRequest} req
- */
 async function readBody(req) {
   if (req.body) {
     if (typeof req.body === 'string') {
       return JSON.parse(req.body);
     }
-
     return req.body;
   }
-
   const raw = await new Promise((resolve, reject) => {
     let data = '';
     req.setEncoding('utf8');
-    req.on('data', chunk => {
-      data += chunk;
-    });
+    req.on('data', chunk => { data += chunk; });
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
-
   return raw ? JSON.parse(raw) : {};
 }
 
 function timingSafeCompare(expected, provided) {
   if (!expected) {
-    console.warn('CNPAY_WEBHOOK_TOKEN não configurado. Configure um token para validar os webhooks.');
     return true;
   }
-
   if (!provided) {
     return false;
   }
-
   const expectedBuffer = Buffer.from(expected);
   const providedBuffer = Buffer.from(provided);
-
   if (expectedBuffer.length !== providedBuffer.length) {
     return false;
   }
-
   return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
 }
 
-/**
- * Manipulador principal do webhook da CN Pay.
- * @param {import('@vercel/node').VercelRequest} req
- * @param {import('@vercel/node').VercelResponse} res
- */
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Método não suportado. Use POST.' });
   }
-
   let payload;
   try {
     payload = await readBody(req);
-  } catch (error) {
-    console.error('Erro ao ler o corpo do webhook:', error);
+  } catch {
     return res.status(400).json({ error: 'Body inválido.' });
   }
-
   const providedToken = req.headers['x-cnpay-token'] || payload?.token;
   const expectedToken = process.env.CNPAY_WEBHOOK_TOKEN || '';
-
   if (!timingSafeCompare(expectedToken, providedToken)) {
     return res.status(401).json({ error: 'Token inválido.' });
   }
-
-  if (!payload?.event) {
-    return res.status(400).json({ error: 'Evento não informado.' });
+  const event = String(payload?.event || '').toUpperCase();
+  const withdraw = payload?.withdraw || {};
+  const clientIdentifier = String(withdraw?.clientIdentifier || '');
+  if (!clientIdentifier) {
+    return res.status(400).json({ error: 'clientIdentifier ausente.' });
   }
-
-  // Aqui você pode implementar suas regras específicas para cada evento.
-  switch (payload.event) {
-    case 'TRANSACTION_CREATED':
-      console.info('Transação criada:', payload.transaction?.id);
-      break;
-    case 'TRANSACTION_PAID':
-      console.info('Transação paga:', payload.transaction?.id);
-      break;
-    case 'TRANSACTION_CANCELED':
-      console.info('Transação cancelada:', payload.transaction?.id);
-      break;
-    case 'TRANSACTION_REFUNDED':
-      console.info('Transação estornada:', payload.transaction?.id);
-      break;
-    default:
-      console.info('Evento não mapeado:', payload.event);
+  const statusStr = String(withdraw?.status || '').toUpperCase();
+  let newStatus = 'PENDING';
+  if (statusStr === 'COMPLETED' || event === 'TRANSFER_COMPLETED') newStatus = 'COMPLETED';
+  else if (statusStr === 'CANCELED' || event === 'TRANSFER_FAILED') newStatus = 'REJECTED';
+  const sent = Array.isArray(payload?.sents) && payload.sents.length ? payload.sents[0] : null;
+  const extra = sent?.endToEndId ? ` • e2e: ${sent.endToEndId}` : '';
+  const { error } = await supabase
+    .from('transactions')
+    .update({ status: newStatus, details: (withdraw?.status ? `CNPay: ${withdraw.status}` : 'CNPay') + extra })
+    .eq('id', clientIdentifier)
+    .eq('type', 'WITHDRAWAL');
+  if (error) {
+    return res.status(500).json({ error: 'Falha ao atualizar transação.' });
   }
-
-  // Exemplo de resposta customizada para a CN Pay
-  return res.status(200).json({
-    received: true,
-    processedAt: new Date().toISOString()
-  });
+  return res.status(200).json({ received: true, status: newStatus, processedAt: new Date().toISOString() });
 }
-
