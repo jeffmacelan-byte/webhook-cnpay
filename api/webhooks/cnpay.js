@@ -33,12 +33,17 @@ function timingSafeCompare(expected, provided) {
   return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
 }
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Método não suportado. Use POST.' });
+  }
+  if (!supabase) {
+    return res.status(500).json({ error: 'Configuração do Supabase ausente. Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.' });
   }
   let payload;
   try {
